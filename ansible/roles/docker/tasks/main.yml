@@ -1,31 +1,44 @@
+# Docker is too swappy.
+- sysctl: name=vm.swappiness value=1 state=present
+
+# Install lvm2
+- apt: name=lvm2
+
+# Install xfsprogs
+- apt: name=xfsprogs
+
 # Setup the docker filesystem if a device exists
 - stat: path=/dev/xvdh
   register: dev_xvdh
-- filesystem: fstype=ext4 dev=/dev/xvdh
+
+- lvg:  vg=vg-docker pvs=/dev/xvdh
   when: dev_xvdh.stat.exists
-  register: new_docker_fs
+  register: docker_vg_xvdh
+
+# Had to run this as a shell command because ansible's
+# logical volume modules don't handle LVM thinpools.
+- shell: lvcreate -l 99%FREE --thinpool vg-docker/docker-thinpool0
+  when: docker_vg_xvdh|changed
+  register: docker_lvol0
   notify:
     - restart_docker
 
 - service: name=docker state=stopped
-  when: new_docker_fs|changed
+  when: docker_lvol0|changed
+
 # Make absolutely sure aufs doesn't exist or docker freaks
 # https://github.com/docker/docker/issues/14026
 - shell: /bin/umount -t aufs -a -f
   ignore_errors: yes
-  when: new_docker_fs|changed
+  when: docker_lvol0|changed
+
 - shell: /bin/umount -f /var/lib/docker/aufs
   ignore_errors: yes
-  when: new_docker_fs|changed
-# Ensure we don't have any left behind images on the old FS
-- shell: /bin/rm -rf /var/lib/docker/*
-  ignore_errors: yes
-  when: new_docker_fs|changed
-- mount: name=/var/lib/docker src=/dev/xvdh fstype=ext4 state=mounted
-  when: new_docker_fs|changed
+  when: docker_lvol0|changed
+
 - file: path=/var/lib/docker/aufs state=absent
   ignore_errors: yes
-  when: new_docker_fs|changed
+  when: docker_lvol0|changed
 
 - copy: src=etc/default/docker dest=/etc/default/docker owner=root group=root mode=0644
   tags:
@@ -36,13 +49,16 @@
 - apt: name=linux-image-extra-{{ansible_kernel}}
   tags: 
     - build_ami
+
 - apt: name=linux-image-extra-virtual
   tags: 
     - build_ami
+
 - apt: name=apparmor
   tags: 
     - build_ami
-- apt: name=docker-engine=1.7.0-0~trusty
+
+- apt: name=docker-engine=1.9.1-0~trusty
   tags: 
     - build_ami
 
@@ -56,9 +72,11 @@
 - copy: src=usr/sbin/docker_maid dest=/usr/sbin/docker_maid owner=root group=root mode=0755
   tags: 
     - build_ami
+
 - cron: name=docker_maid cron_file=docker_maid user=root minute="15" hour="2,10,18" job="/usr/sbin/docker_maid"
   tags: 
     - build_ami
+
 - name: Adding ubuntu to docker group
   user: name=ubuntu groups=docker append=yes
   tags: 
